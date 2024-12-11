@@ -15,7 +15,7 @@ OSAL(operating system abstraction layer)，操作系统抽象层，是一种以�
 
 1. 完成hal\timer.c文件，为系统提供滴答时钟，建议滴答心跳的周期为1～10ms，并对应修改hal\timer.h中的宏定义TICK_PERIOD_MS为相应心跳毫秒值；
 2. 修改osal\type.h文件中的全局中断开关宏定义（可为空），根据需要修改数据类型的宏定义，根据实际芯片字长修改“halDataAlign_t”类型；
-3. 根据需要修改osal\osal_memory.h文件中的内存池大小定义，默认最大为32768字节，osal\osal_memory.c中osalMemHdr_t类型需要确保长度为16bit或以上，非8位单片机需要设定内存池的字节对齐；
+3. 根据需要修改osal\osal_memory.h文件中的内存池大小定义，默认最大为32768字节，osal\osal_memory.c中osal_mem_hdr_t类型需要确保长度为16bit或以上，非8位单片机需要设定内存池的字节对齐；
 4. 添加任务函数中的任务优先级数值大的任务则优先级高；
 5. 根据需要修改osal\osal_memory.h文件中的OSALMEM_METRICS定义，有效则开启内存统计功能；
 
@@ -26,8 +26,8 @@ OSAL(operating system abstraction layer)，操作系统抽象层，是一种以�
 OSAL中默认使用15位的数据标识管理内存，最大能管理32768字节，需要增加管理更多的动态内存可按照以下方式拓展：
 
 1. 注释掉osal_memory.c中的内存大小编译限制；
-2. 替换osal_memory.c中的全部uint16为osalMemHdr_t；
-3. 修改osal_memory.h中的osalMemHdr_t类型宏为halDataAlign_t，确保芯片字长halDataAlign_t为32bit；
+2. 替换osal_memory.c中的全部uint16为osal_mem_hdr_t；
+3. 修改osal_memory.h中的osal_mem_hdr_t类型宏为halDataAlign_t，确保芯片字长halDataAlign_t为32bit；
 4. 修改osal_memory.c中的宏定义OSALMEM_IN_USE为0x80000000；
 
 ## 编译运行

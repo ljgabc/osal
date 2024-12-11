@@ -1,438 +1,335 @@
-#include "osal_msg.h"
-#include "osal_memory.h"
-#include "osal_event.h"
-
-#define SYS_EVENT_MSG               0x8000
-
-/*********************************************************************
- * @fn osal_msg_allocate
+/**
+ * @file osal_msg.c
+ * @author ljgabc
+ * @brief 消息处理
+ * @version 0.1
+ * @date 2024-11-30
  *
- * @brief
+ * @copyright Copyright (c) 2024
  *
- *    This function is called by a task to allocate a message buffer
- *    into which the task will encode the particular message it wishes
- *    to send.  This common buffer scheme is used to strictly limit the
- *    creation of message buffers within the system due to RAM size
- *    limitations on the microprocessor.   Note that all message buffers
- *    are a fixed size (at least initially).  The parameter len is kept
- *    in case a message pool with varying fixed message sizes is later
- *    created (for example, a pool of message buffers of size LARGE,
- *    MEDIUM and SMALL could be maintained and allocated based on request
- *    from the tasks).
- *
- * @param   uint8 len  - wanted buffer length
- * @return  pointer to allocated buffer or NULL if allocation failed.
  */
-uint8 * osal_msg_allocate(uint16 len)
-{
-    osal_msg_hdr_t *hdr;
+#include "osal.h"
 
-    if(len == 0)
-    {
-        return (NULL);
-    }
+#define SYS_EVENT_MSG 0x8000
 
-    hdr = (osal_msg_hdr_t *) osal_mem_alloc((short)(len + sizeof(osal_msg_hdr_t)));
-    if(hdr)
-    {
-        hdr->next = NULL;
-        hdr->len = len;
-        hdr->dest_id = TASK_NO_TASK;
-        return ((uint8 *)(hdr + 1));
-    }
-    else
-    {
-        return (NULL);
-    }
+#define OSAL_MSG_NEXT(msg_ptr) ((struct osal_msg_hdr *)(msg_ptr) - 1)->next
+#define OSAL_MSG_TASK(msg_ptr) ((struct osal_msg_hdr *)(msg_ptr) - 1)->task
+
+struct osal_msg_hdr {
+  struct osal_msg_hdr *next;
+  struct osal_tcb *task;
+  uint16_t len;
+};
+
+static struct osal_msg_hdr *osal_qHead;
+
+// 消息队列头指针
+static void *msg_queue_head = NULL;
+
+// 消息队列尾指针
+static void *msg_queue_tail = NULL;
+
+// typedef struct {
+//   uint8_t event;
+//   uint8_t status;
+// } osal_event_hdr_t;
+
+// // 默认系统消息结构体
+// typedef struct {
+//   osal_event_hdr_t hdr;
+//   uint8_t *Data_t;
+// } osal_sys_msg_t;
+
+/**
+ * @brief 任务调用此函数来分配消息缓冲区
+ *
+ * @param len 所需缓冲区长度(不含消息头)
+ * @return uint8_t*
+ * 指向已分配缓冲区的指针，只包含消息本体，可以直接使用；失败返回NULL
+ */
+uint8_t *osal_msg_allocate(uint16_t len) {
+  struct osal_msg_hdr *hdr;
+
+  if (len == 0) {
+    return (NULL);
+  }
+
+  hdr = (struct osal_msg_hdr *)osal_mem_alloc(
+      (uint16_t)(len + sizeof(struct osal_msg_hdr)));
+  if (hdr) {
+    hdr->next = NULL;
+    hdr->task = NULL;
+    hdr->len = len;
+    return ((uint8_t *)(hdr + 1)); // 返回消息本体的指针（跳过消息头）
+  } else {
+    return (NULL);
+  }
 }
 
-/*********************************************************************
- * @fn osal_msg_deallocate
+/**
+ * @brief 任务完成对收到的消息处理后，调用此函数释放缓冲区
+ * @param msg_ptr 指向缓冲区的指针
  *
- * @brief
- *
- *    This function is used to deallocate a message buffer. This function
- *    is called by a task (or processing element) after it has finished
- *    processing a received message.
- *
- *
- * @param   uint8 *msg_ptr - pointer to new message buffer
- *
- * @return  SUCCESS, INVALID_MSG_POINTER
+ * @return uint8_t 成功返回OK
  */
-uint8 osal_msg_deallocate(uint8 *msg_ptr)
-{
-    uint8 *x;
+uint8_t osal_msg_deallocate(uint8_t *msg_ptr) {
+  if (msg_ptr == NULL) {
+    return (OSAL_INVALID_MSG_POINTER);
+  }
 
-    if(msg_ptr == NULL)
-    {
-        return (INVALID_MSG_POINTER);
-    }
+  // 如果消息在队列中，返回错误
+  if ((OSAL_MSG_TASK(msg_ptr) != NULL) || (OSAL_MSG_NEXT(msg_ptr) != NULL)) {
+    return (OSAL_MSG_BUFFER_NOT_AVAIL);
+  }
 
-    // don't deallocate queued buffer
-    if(OSAL_MSG_ID(msg_ptr) != TASK_NO_TASK)
-    {
-        return (MSG_BUFFER_NOT_AVAIL);
-    }
+  uint8_t *ptr = (uint8_t *)((uint8_t *)msg_ptr - sizeof(struct osal_msg_hdr));
 
-    x = (uint8 *)((uint8 *)msg_ptr - sizeof(osal_msg_hdr_t));
+  osal_mem_free((void *)ptr);
 
-    osal_mem_free((void *)x);
-
-    return (SUCCESS);
+  return (OSAL_OK);
 }
 
-/*********************************************************************
- * @fn osal_msg_send
- *
+/**
  * @brief
+ * 任务调用此函数向其他任务发送命令或消息，消息的释放由接收方负责，发送方不用管。
  *
- *    This function is called by a task to send a command message to
- *    another task or processing element.  The sending_task field must
- *    refer to a valid task, since the task ID will be used
- *    for the response message.  This function will also set a message
- *    ready event in the destination tasks event list.
- *
- *
- * @param   uint8 destination task - Send msg to?  Task ID
- * @param   uint8 *msg_ptr - pointer to new message buffer
- * @param   uint8 len - length of data in message
- *
- * @return  SUCCESS, INVALID_TASK, INVALID_MSG_POINTER
+ * @param task 目标任务
+ * @param msg_ptr 通过osal_msg_allocate申请到的消息缓冲区指针
+ * @return uint8_t 成功返回OK
  */
-uint8 osal_msg_send(uint8 destination_task, uint8 *msg_ptr)
-{
-    if(msg_ptr == NULL)
-    {
-        return (INVALID_MSG_POINTER);
-    }
+uint8_t osal_msg_send(const struct osal_tcb *task, uint8_t *msg_ptr) {
+  if (msg_ptr == NULL) {
+    return (OSAL_INVALID_MSG_POINTER);
+  }
 
-    if(destination_task >= tasksCnt)
-    {
-        osal_msg_deallocate(msg_ptr);
-        return (INVALID_TASK);
-    }
+  // 发送方不负责消息缓冲区的释放，如果task不存在，需要释放缓冲区
+  if (task == NULL) {
+    osal_msg_deallocate(msg_ptr);
+    return (OSAL_INVALID_TASK);
+  }
 
-    // Check the message header
-    if(OSAL_MSG_NEXT(msg_ptr) != NULL ||
-            OSAL_MSG_ID(msg_ptr) != TASK_NO_TASK)
-    {
-        osal_msg_deallocate(msg_ptr);
-        return (INVALID_MSG_POINTER);
-    }
+  // 将消息入队
+  OSAL_MSG_TASK(msg_ptr) = task;
+  osal_msg_enqueue(msg_ptr);
 
-    OSAL_MSG_ID(msg_ptr) = destination_task;
+  // 通知任务有消息
+  osal_set_event(task, SYS_EVENT_MSG);
 
-    // queue message
-    osal_msg_enqueue(&osal_qHead, msg_ptr);
-
-    // Signal the task that a message is waiting
-    osal_set_event(destination_task, SYS_EVENT_MSG);
-
-    return (SUCCESS);
+  return (OSAL_OK);
 }
 
-/*********************************************************************
- * @fn osal_msg_receive
+/**
+ * @brief 任务调用此函数接受和处理消息
+ * 在处理完消息后，任务需要调用osal_msg_deallocate来释放消息缓冲区
  *
- * @brief
- *
- *    This function is called by a task to retrieve a received command
- *    message. The calling task must deallocate the message buffer after
- *    processing the message using the osal_msg_deallocate() call.
- *
- * @param   uint8 task_id - receiving tasks ID
- *
- * @return  *uint8 - message information or NULL if no message
+ * @param task_id
+ * @return uint8_t*
  */
-uint8 *osal_msg_receive(uint8 task_id)
-{
-    osal_msg_hdr_t *listHdr;
-    osal_msg_hdr_t *prevHdr = NULL;
-    osal_msg_hdr_t *foundHdr = NULL;
+uint8_t *osal_msg_receive(const struct osal_tcb *task) {
+  struct osal_msg_hdr *listHdr;
+  struct osal_msg_hdr *prevHdr = NULL;
+  struct osal_msg_hdr *foundHdr = NULL;
 
+  // Hold off interrupts
+  hal_reg_t cpu_sr = hal_enter_critical();
 
-    // Hold off interrupts
-    HAL_ENTER_CRITICAL_SECTION();
+  // Point to the top of the queue
+  listHdr = osal_qHead;
 
-    // Point to the top of the queue
-    listHdr = osal_qHead;
-
-    // Look through the queue for a message that belongs to the asking task
-    while(listHdr != NULL)
-    {
-        if((listHdr - 1)->dest_id == task_id)
-        {
-            if(foundHdr == NULL)
-            {
-                // Save the first one
-                foundHdr = listHdr;
-            }
-            else
-            {
-                // Second msg found, stop looking
-                break;
-            }
-        }
-        if(foundHdr == NULL)
-        {
-            prevHdr = listHdr;
-        }
-        listHdr = OSAL_MSG_NEXT(listHdr);
+  // Look through the queue for a message that belongs to the asking task
+  while (listHdr != NULL) {
+    if ((listHdr - 1)->task == task) {
+      if (foundHdr == NULL) {
+        // Save the first one
+        foundHdr = listHdr;
+      } else {
+        // Second msg found, stop looking
+        break;
+      }
     }
-
-    // Is there more than one?
-    if(listHdr != NULL)
-    {
-        // Yes, Signal the task that a message is waiting
-        osal_set_event(task_id, SYS_EVENT_MSG);
+    if (foundHdr == NULL) {
+      prevHdr = listHdr;
     }
-    else
-    {
-        // No more
-        osal_clear_event(task_id, SYS_EVENT_MSG);
-    }
+    listHdr = OSAL_MSG_NEXT(listHdr);
+  }
 
-    // Did we find a message?
-    if(foundHdr != NULL)
-    {
-        // Take out of the link list
-        osal_msg_extract(&osal_qHead, foundHdr, prevHdr);
-    }
+  // Is there more than one?
+  if (listHdr != NULL) {
+    // Yes, Signal the task that a message is waiting
+    osal_set_event(task, SYS_EVENT_MSG);
+  } else {
+    // No more
+    osal_clear_event(task, SYS_EVENT_MSG);
+  }
 
-    // Release interrupts
-    HAL_EXIT_CRITICAL_SECTION();
+  // Did we find a message?
+  if (foundHdr != NULL) {
+    // Take out of the link list
+    osal_msg_extract(&osal_qHead, foundHdr, prevHdr);
+  }
 
-    return ((uint8*) foundHdr);
+  // Release interrupts
+  hal_exit_critical(cpu_sr);
+
+  return ((uint8_t *)foundHdr);
 }
 
-/**************************************************************************************************
- * @fn     osal_msg_find
+/**
+ * @brief 查找与指定task_id和event参数匹配的消息
  *
- * @brief       This function finds in place an OSAL message matching the task_id and event
- *              parameters.
- *
- * input parameters
- *
- * @param       task_id - The OSAL task id that the enqueued OSAL message must match.
- * @param       event - The OSAL event id that the enqueued OSAL message must match.
- *
- * output parameters
- *
- * None.
- *
- * @return      NULL if no match, otherwise an in place pointer to the matching OSAL message.
- **************************************************************************************************
+ * @param task_id 目标任务
+ * @param event 目标事件
+ * @return osal_event_hdr_t* 消息头
  */
-osal_event_hdr_t *osal_msg_find(uint8 task_id, uint8 event)
-{
-    osal_msg_hdr_t *pHdr;
+osal_event_hdr_t *osal_msg_find(const struct osal_tcb *task, uint8_t event) {
+  struct osal_msg_hdr *pHdr;
 
+  // Hold off interrupts.
+  hal_reg_t cpu_sr = hal_enter_critical();
 
-    HAL_ENTER_CRITICAL_SECTION();  // Hold off interrupts.
+  pHdr = osal_qHead; // Point to the top of the queue.
 
-    pHdr = osal_qHead;  // Point to the top of the queue.
-
-    // Look through the queue for a message that matches the task_id and event parameters.
-    while(pHdr != NULL)
-    {
-        if(((pHdr - 1)->dest_id == task_id) && (((osal_event_hdr_t *)pHdr)->event == event))
-        {
-            break;
-        }
-
-        pHdr = OSAL_MSG_NEXT(pHdr);
+  // Look through the queue for a message that matches the task_id and event
+  // parameters.
+  while (pHdr != NULL) {
+    if (((pHdr - 1)->task == task) &&
+        (((osal_event_hdr_t *)pHdr)->event == event)) {
+      break;
     }
 
-    HAL_EXIT_CRITICAL_SECTION();  // Release interrupts.
+    pHdr = OSAL_MSG_NEXT(pHdr);
+  }
 
-    return (osal_event_hdr_t *)pHdr;
+  hal_exit_critical(cpu_sr); // Release interrupts.
+
+  return (osal_event_hdr_t *)pHdr;
 }
 
-/*********************************************************************
- * @fn osal_msg_enqueue
+/**
+ * @brief 强制将一个OSAL消息入队到OSAL队列中
  *
- * @brief
- *
- *    This function enqueues an OSAL message into an OSAL queue.
- *
- * @param   osal_msg_q_t *q_ptr - OSAL queue
- * @param   void *msg_ptr  - OSAL message
- *
- * @return  none
+ * @param q_ptr 队列指针
+ * @param msg_ptr 消息指针
  */
-void osal_msg_enqueue(osal_msg_q_t *q_ptr, void *msg_ptr)
-{
-    void *list;
+void osal_msg_enqueue(void *msg_ptr) {
 
+  hal_reg_t cpu_sr = hal_enter_critical();
 
-    // Hold off interrupts
-    HAL_ENTER_CRITICAL_SECTION();
+  OSAL_MSG_NEXT(msg_ptr) = NULL;
 
+  // If first message in queue
+  if (msg_queue_head == NULL) {
+    msg_queue_head = msg_ptr;
+  } else {
+    // Add message to end of queue
+    void *ptr = msg_queue_head;
+    while (OSAL_MSG_NEXT(ptr) != NULL) {
+      ptr = OSAL_MSG_NEXT(ptr);
+    }
+    OSAL_MSG_NEXT(ptr) = msg_ptr;
+  }
+  hal_exit_critical(cpu_sr);
+}
+
+/**
+ * @brief 从消息队列中取出一条消息
+ *
+ * @param q_ptr 队列指针
+ * @return void* 成功返回消息指针，队列为空返回NULL
+ */
+void *osal_msg_dequeue() {
+  void *msg_ptr = NULL;
+
+  hal_reg_t cpu_sr = hal_enter_critical();
+
+  if (msg_queue_head != NULL) {
+    // Dequeue message
+    msg_ptr = msg_queue_head;
     OSAL_MSG_NEXT(msg_ptr) = NULL;
-    // If first message in queue
-    if(*q_ptr == NULL)
-    {
-        *q_ptr = msg_ptr;
-    }
-    else
-    {
-        // Find end of queue
-        for(list = *q_ptr; OSAL_MSG_NEXT(list) != NULL; list = OSAL_MSG_NEXT(list));
+    msg_queue_head = OSAL_MSG_NEXT(msg_ptr);
+  }
 
-        // Add message to end of queue
-        OSAL_MSG_NEXT(list) = msg_ptr;
-    }
+  hal_exit_critical(cpu_sr);
 
-    // Re-enable interrupts
-    HAL_EXIT_CRITICAL_SECTION();
+  return msg_ptr;
 }
 
-/*********************************************************************
- * @fn osal_msg_dequeue
+/**
+ * @brief 将消息添加到队列头
  *
- * @brief
- *
- *    This function dequeues an OSAL message from an OSAL queue.
- *
- * @param   osal_msg_q_t *q_ptr - OSAL queue
- *
- * @return  void * - pointer to OSAL message or NULL of queue is empty.
+ * @param q_ptr 队列指针
+ * @param msg_ptr 消息指针
  */
-void *osal_msg_dequeue(osal_msg_q_t *q_ptr)
-{
-    void *msg_ptr = NULL;
+void osal_msg_push(void *msg_ptr) {
+  hal_reg_t cpu_sr = hal_enter_critical();
 
+  // Push message to head of queue
+  OSAL_MSG_NEXT(msg_ptr) = msg_queue_head;
+  msg_queue_head = msg_ptr;
 
-    // Hold off interrupts
-    HAL_ENTER_CRITICAL_SECTION();
-
-    if(*q_ptr != NULL)
-    {
-        // Dequeue message
-        msg_ptr = *q_ptr;
-        *q_ptr = OSAL_MSG_NEXT(msg_ptr);
-        OSAL_MSG_NEXT(msg_ptr) = NULL;
-        OSAL_MSG_ID(msg_ptr) = TASK_NO_TASK;
-    }
-
-    // Re-enable interrupts
-    HAL_EXIT_CRITICAL_SECTION();
-
-    return msg_ptr;
+  hal_exit_critical(cpu_sr);
 }
 
-/*********************************************************************
- * @fn osal_msg_push
+/**
+ * @brief 从队列中移除一个消息
  *
- * @brief
- *
- *    This function pushes an OSAL message to the head of an OSAL
- *    queue.
- *
- * @param   osal_msg_q_t *q_ptr - OSAL queue
- * @param   void *msg_ptr  - OSAL message
- *
- * @return  none
+ * @param q_ptr 队列指针
+ * @param msg_ptr 要取出的消息指针
+ * @param prev_ptr msg_ptr的前一个节点指针
  */
-void osal_msg_push(osal_msg_q_t *q_ptr, void *msg_ptr)
-{
-    // Hold off interrupts
-    HAL_ENTER_CRITICAL_SECTION();
+void osal_msg_extract(void *msg_ptr, void *prev_ptr) {
+  hal_reg_t cpu_sr = hal_enter_critical();
 
-    // Push message to head of queue
-    OSAL_MSG_NEXT(msg_ptr) = *q_ptr;
-    *q_ptr = msg_ptr;
+  if (msg_ptr == msg_queue_head) {
+    // remove from first
+    msg_queue_head = OSAL_MSG_NEXT(msg_ptr);
+  } else {
+    // remove from middle
+    OSAL_MSG_NEXT(prev_ptr) = OSAL_MSG_NEXT(msg_ptr);
+  }
+  OSAL_MSG_NEXT(msg_ptr) = NULL;
 
-    // Re-enable interrupts
-    HAL_EXIT_CRITICAL_SECTION();
+  // Re-enable interrupts
+  hal_exit_critical(cpu_sr);
 }
 
-/*********************************************************************
- * @fn osal_msg_extract
+/**
+ * @brief 尝试将一个OSAL消息入队到OSAL队列中，如果队列满了，则放弃
  *
- * @brief
- *
- *    This function extracts and removes an OSAL message from the
- *    middle of an OSAL queue.
- *
- * @param   osal_msg_q_t *q_ptr - OSAL queue
- * @param   void *msg_ptr  - OSAL message to be extracted
- * @param   void *prev_ptr  - OSAL message before msg_ptr in queue
- *
- * @return  none
+ * @param q_ptr 队列指针
+ * @param msg_ptr 消息指针
+ * @param max 队列长度
+ * @return uint8_t 成功入队返回OK
  */
-void osal_msg_extract(osal_msg_q_t *q_ptr, void *msg_ptr, void *prev_ptr)
-{
-    // Hold off interrupts
-    HAL_ENTER_CRITICAL_SECTION();
+uint8_t osal_msg_enqueue_max(void *msg_ptr, uint8_t max) {
+  void *list;
+  uint8_t ret = FALSE;
 
-    if(msg_ptr == *q_ptr)
-    {
-        // remove from first
-        *q_ptr = OSAL_MSG_NEXT(msg_ptr);
-    }
-    else
-    {
-        // remove from middle
-        OSAL_MSG_NEXT(prev_ptr) = OSAL_MSG_NEXT(msg_ptr);
-    }
-    OSAL_MSG_NEXT(msg_ptr) = NULL;
-    OSAL_MSG_ID(msg_ptr) = TASK_NO_TASK;
+  // Hold off interrupts
+  hal_reg_t cpu_sr = hal_enter_critical();
 
-    // Re-enable interrupts
-    HAL_EXIT_CRITICAL_SECTION();
-}
-
-/*********************************************************************
- * @fn osal_msg_enqueue_max
- *
- * @brief
- *
- *    This function enqueues an OSAL message into an OSAL queue if
- *    the length of the queue is less than max.
- *
- * @param   osal_msg_q_t *q_ptr - OSAL queue
- * @param   void *msg_ptr  - OSAL message
- * @param   uint8 max - maximum length of queue
- *
- * @return  TRUE if message was enqueued, FALSE otherwise
- */
-uint8 osal_msg_enqueue_max(osal_msg_q_t *q_ptr, void *msg_ptr, uint8 max)
-{
-    void *list;
-    uint8 ret = FALSE;
-
-    // Hold off interrupts
-    HAL_ENTER_CRITICAL_SECTION();
-
-    // If first message in queue
-    if(*q_ptr == NULL)
-    {
-        *q_ptr = msg_ptr;
-        ret = TRUE;
-    }
-    else
-    {
-        // Find end of queue or max
-        list = *q_ptr;
-        max--;
-        while((OSAL_MSG_NEXT(list) != NULL) && (max > 0))
-        {
-            list = OSAL_MSG_NEXT(list);
-            max--;
-        }
-
-        // Add message to end of queue if max not reached
-        if(max != 0)
-        {
-            OSAL_MSG_NEXT(list) = msg_ptr;
-            ret = TRUE;
-        }
+  // If first message in queue
+  if (msg_queue_head == NULL) {
+    msg_queue_head = msg_ptr;
+    ret = TRUE;
+  } else {
+    // Find end of queue or max
+    list = msg_queue_head;
+    max--;
+    while ((OSAL_MSG_NEXT(list) != NULL) && (max > 0)) {
+      list = OSAL_MSG_NEXT(list);
+      max--;
     }
 
-    // Re-enable interrupts
-    HAL_EXIT_CRITICAL_SECTION();
+    // Add message to end of queue if max not reached
+    if (max != 0) {
+      OSAL_MSG_NEXT(list) = msg_ptr;
+      ret = TRUE;
+    }
+  }
 
-    return ret;
+  // Re-enable interrupts
+  hal_exit_critical(cpu_sr);
+
+  return ret;
 }

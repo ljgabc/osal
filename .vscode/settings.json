@@ -1,0 +1,15 @@
+{
+    "files.associations": {
+        "osal_memory.h": "c",
+        "osal_timer.h": "c",
+        "hal_tickh": "cpp",
+        "osal_event.h": "c",
+        "osal_type.h": "c",
+        "hal_type.h": "c",
+        "cstddef": "c",
+        "osal.h": "c",
+        "osal_msg.h": "c",
+        "osal_types.h": "c",
+        "hal_types.h": "c"
+    }
+}

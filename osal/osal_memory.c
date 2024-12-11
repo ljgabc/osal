@@ -1,352 +1,447 @@
-#include "osal_memory.h"
-#include "type.h"
-
-#if ( MAXMEMHEAP >= 32768 )             //内存管理默认使用15位数据标识，最大能管理32768字节
-#error MAXMEMHEAP is too big to manage!
-#endif
-
-//查找到合适的内存块之后，就要决定是否对此内存块进行分割。
-//如果内存块过大的话必然会造成内存的浪费。
-//如果内存块的大小减去要申请的内存块的值大于OSALMEM_MIN_BLKSZ(4byte)，
-//则分割此内存块。并初使化分割出来的内存分配控制块头。
-#if !defined ( OSALMEM_MIN_BLKSZ )
-#define OSALMEM_MIN_BLKSZ    4
-#endif
-
-#if !defined ( OSALMEM_SMALL_BLKSZ )
-#define OSALMEM_SMALL_BLKSZ  16     //固定内存分配区域的固定长度，16字节
-#endif
-
-#if !defined ( OSALMEM_GUARD )
-#define OSALMEM_GUARD  TRUE         // TBD - Hacky workaround til Bugzilla 1252 is fixed!
-#define OSALMEM_READY  0xE2
-#endif
-
-//内存分配返回的是一个指向分配区域的指针，指针的长度是内存控制头和内存对齐方式中较大的一个。
-//并且这个长度也是最小分配单元的长度。在OSAL中它的长度是16bit。
-//此处需要根据实际编译环境修改，确保osalMemHdr_t长度为16bit或以上
-typedef halDataAlign_t  osalMemHdr_t;
-
-/*********************************************************************
- * CONSTANTS
+/**
+ * @file osal_memory.h
+ * @author ljgabc
+ * @brief 动态内存管理器
+ * 内存管理器申请了一个大数组theheap做为内存空间，然后把内存空间分成两个部分，
+ * 第一个部分是针对小块内存的管理，第二部分是针对大块内存的管理。
+ * 这样做的好处是容易申请到连续的大空间，因为小块内存处理会使整个内存空间碎片化，
+ * 从而会导致内存空间不连续，不连续的空间是对申请大空间是非常不利的。
+ * 在系统初始化阶段申请的内存(一般不会被释放的内存，成为常驻内存)也是在小块内存区域进行申请
+ * @version 0.1
+ * @date 2024-11-28
+ *
+ * @copyright Copyright (c) 2024
+ *
  */
 
-#define OSALMEM_IN_USE  0x8000        //内存控制头（16位）最高位标识该内存块是否被使用
+#ifdef __cplusplus
+extern "C" {
+#endif
 
-/* This number sets the size of the small-block bucket. Although profiling
- * shows max simultaneous alloc of 16x18, timing without profiling overhead
- * shows that the best worst case is achieved with the following.
-   根据程序的概要分析，最大的同时分配的大小是16x18, 如果不进行程序概要分析，
-   在定时分析系统的开销时，最坏情况里面的最好情况的内存分配大小是232(byte)的长度。
-   所以把固定分配区域的长度定义为232（byte）。
+#include "osal.h"
+
+#define OSALMEM_IN_USE (0x1 << 31)
+
+// 在32位MCU上，内存块头占用4个字节
+#define OSALMEM_HDRSZ sizeof(osal_mem_hdr_t)
+
+/**
+ * @brief
+ * 将一个数按OSALMEM_HDRSZ向上取整，比如输入1、2、3、4输出是4，输入5、6、7、8输出是8
+ * 方便做内存字对齐
  */
-#define SMALLBLKHEAP    232
+#define OSALMEM_ROUND(X)                                                       \
+  ((((X) + OSALMEM_HDRSZ - 1) / OSALMEM_HDRSZ) * OSALMEM_HDRSZ)
 
-//内存分配返回的是一个指向分配区域的指针，指针的长度是内存控制头和内存对齐方式中较大的一个。
-//并且这个长度也是最小分配单元的长度。在些OSAL中它的长度是16bit。
-//此处需要根据实际编译环境修改，确保osalMemHdr_t长度为16bit或以上
-// To maintainalignment of the pointer returned, reserve the greater
-// space for the memory block header.
-#define HDRSZ  ( (sizeof ( halDataAlign_t ) > sizeof( osalMemHdr_t )) ? \
-                  sizeof ( halDataAlign_t ) : sizeof( osalMemHdr_t ) )
-
-#if ( OSALMEM_GUARD )
-static byte ready = 0;
+/**
+ * @brief 当一个块剩余的内存小于此值时，再分割剩余的内存也很小了，可能用不上了
+ * 分割出来太多小的内存块之后，内存申请的效率会降低
+ * 但如果剩余的比较多，又会造成内存浪费，需要根据实际情况分配一个比较合理的值
+ * 当块剩余内存小于该值时，不进行分割了，直接返回
+ */
+#ifndef OSALMEM_MIN_BLKSZ
+#define OSALMEM_MIN_BLKSZ (OSALMEM_ROUND((OSALMEM_HDRSZ * 2)))
 #endif
 
-static osalMemHdr_t *ff1;  // First free block in the small-block bucket.
-static osalMemHdr_t *ff2;  // First free block after the small-block bucket.
-
-#if defined( EXTERNAL_RAM )
-static byte  *theHeap = (byte *)EXT_RAM_BEG;
-#else
-static halDataAlign_t _theHeap[ MAXMEMHEAP / sizeof(halDataAlign_t) ];
-// static __align(32) halDataAlign_t _theHeap[ MAXMEMHEAP / sizeof( halDataAlign_t ) ];
-//根据实际使用的芯片设定内存对齐，__align(32)，非常重要！！！
-static byte  *theHeap = (byte *)_theHeap;
+/**
+ * @brief 小块内存区域的内存管理单元大小，当申请内存小于此值时在小块区域进行申请
+ */
+#if !defined OSALMEM_SMALL_BLKSZ
+#define OSALMEM_SMALL_BLKSZ (OSALMEM_ROUND(16))
 #endif
+
+/**
+ * @brief 小块内存区域的数量
+ *
+ */
+#if !defined OSALMEM_SMALL_BLKCNT
+#define OSALMEM_SMALL_BLKCNT 8
+#endif
+
+/**
+ * @brief
+ * 常驻内存区域大小，比如创建的线程、初始化阶段申请的内存，这些一般不会被释放，可以认为是常驻的内存
+ *
+ */
+#if !defined OSALMEM_LL_BLKSZ
+#define OSALMEM_LL_BLKSZ (OSALMEM_ROUND(6) + (1 * OSALMEM_HDRSZ))
+#endif
+
+/**
+ * @brief 小块内存管理区域的总大小，包含常驻内存部分
+ *
+ */
+#define OSALMEM_SMALLBLK_BUCKET                                                \
+  ((OSALMEM_SMALL_BLKSZ * OSALMEM_SMALL_BLKCNT) + OSALMEM_LL_BLKSZ)
+
+/**
+ * @brief 两块内存管理区中间空出来一个块，设置为占用，避免两块区域之间混淆
+ * OSALMEM_SMALLBLK_HDRCNT就代表了这个块的索引
+ *
+ */
+#define OSALMEM_SMALLBLK_HDRCNT (OSALMEM_SMALLBLK_BUCKET / OSALMEM_HDRSZ)
+
+/**
+ * @brief 大块内存管理区域第一个块的索引
+ *
+ */
+#define OSALMEM_BIGBLK_IDX (OSALMEM_SMALLBLK_HDRCNT + 1)
+
+/**
+ * @brief 大块内存管理区域的总大小，
+ * 总内存大小减去小块内存区域，再减去两个头块（一个在两个内存中间，一个在整个内存尾部）
+ */
+#define OSALMEM_BIGBLK_SZ                                                      \
+  (MAXMEMHEAP - OSALMEM_SMALLBLK_BUCKET - OSALMEM_HDRSZ * 2)
+
+/**
+ * @brief 内存最后一个块的索引，将其val设置为0，代表内存管理区域到头了
+ *
+ */
+#define OSALMEM_LASTBLK_IDX ((MAXMEMHEAP / OSALMEM_HDRSZ) - 1)
+
+#if OSALMEM_PROFILER
+#define OSALMEM_INIT 'X'
+#define OSALMEM_ALOC 'A'
+#define OSALMEM_REIN 'F'
+#endif
+
+typedef union {
+  uint32_t val;
+  struct {
+    // 低31位表示内存块的大小(包括头部分)
+    unsigned len : 31;
+    // 最高位表示内存块是否被使用
+    unsigned inUse : 1;
+  };
+} osal_mem_hdr_t;
+
+static osal_mem_hdr_t theHeap[MAXMEMHEAP / OSALMEM_HDRSZ];
+static osal_mem_hdr_t *ff1; // First free block in the small-block bucket.
+static uint8_t mem_stat;    // Discrete status flags: 0x01 = kicked.
 
 #if OSALMEM_METRICS
-static uint16 blkMax;  // Max cnt of all blocks ever seen at once.
-static uint16 blkCnt;  // Current cnt of all blocks.
-static uint16 blkFree; // Current cnt of free blocks.
-static uint16 memAlo;  // Current total memory allocated.
-static uint16 memMax;  // Max total memory ever allocated at once.
-#endif
-/*********************************************************************
- * LOCAL FUNCTIONS
- */
-
-/*********************************************************************
- * @fn osal_mem_init
- *
- * @brief   Initialize the heap memory management system.
- *
- * @param   void
- *
- * @return  void
- */
-void osal_mem_init(void)
-{
-    osalMemHdr_t *tmp;
-    // Setup a NULL block at the end of the heap for fast comparisons with zero.
-    //整个内存池最后的两个字节清零，避免分配内存产生溢出
-    tmp = (osalMemHdr_t *)theHeap + (MAXMEMHEAP / HDRSZ) - 1;
-    *tmp = 0;
-
-    // Setup a small-block bucket.
-    //设置固定长度内存区长度，232字节，内存区第一个字保存该区长度
-    tmp = (osalMemHdr_t *)theHeap;
-    *tmp = SMALLBLKHEAP;
-
-    // Setup the wilderness.
-    //设置可变产地内存区长度，内存区第一个字保存该区长度
-    tmp = (osalMemHdr_t *)theHeap + (SMALLBLKHEAP / HDRSZ);
-    *tmp = ((MAXMEMHEAP / HDRSZ) * HDRSZ) - SMALLBLKHEAP - HDRSZ;
-
-#if ( OSALMEM_GUARD )
-    ready = OSALMEM_READY;
+static uint16_t blkMax;  // Max cnt of all blocks ever seen at once.
+static uint16_t blkCnt;  // Current cnt of all blocks.
+static uint16_t blkFree; // Current cnt of free blocks.
+static uint16_t memAlo;  // Current total memory allocated.
+static uint16_t memMax;  // Max total memory ever allocated at once.
 #endif
 
-    // Setup a NULL block that is never freed so that the small-block bucket
-    // is never coalesced with the wilderness.
-    ff1 = tmp;
-    ff2 = osal_mem_alloc(0);
-    ff1 = (osalMemHdr_t *)theHeap;
-    /*
-    上述语句将在固定长度分配区域和可变分配区域之间申请一个0大小的内存块，
-    相当于在固定分配区域和可变分配区域之间保留了一个一直处于使用状态，
-    但是指向长度为0的一个内存分配控制块。
-    这个内存块的是将两个分配区域隔离开，以免和可变长度分配区域合并。
-    */
+#if OSALMEM_PROFILER
+#define OSALMEM_PROMAX 8
+/* The profiling buckets must differ by at least OSALMEM_MIN_BLKSZ; the
+ * last bucket must equal the max alloc size. Set the bucket sizes to
+ * whatever sizes necessary to show how your application is using memory.
+ */
+static uint16_t proCnt[OSALMEM_PROMAX] = {
+    OSALMEM_SMALL_BLKSZ, 48, 112, 176, 192, 224, 256, 65535};
+static uint16_t proCur[OSALMEM_PROMAX] = {0};
+static uint16_t proMax[OSALMEM_PROMAX] = {0};
+static uint16_t proTot[OSALMEM_PROMAX] = {0};
+static uint16_t proSmallBlkMiss;
+#endif
 
-#if ( OSALMEM_METRICS )
-    /* Start with the small-block bucket and the wilderness - don't count the
-     * end-of-heap NULL block nor the end-of-small-block NULL block.
-     */
-    blkCnt = blkFree = 2;
-    memAlo = 0;
+#ifdef DPRINTF_HEAPTRACE
+extern int dprintf(const char *fmt, ...);
+#endif /* DPRINTF_HEAPTRACE */
+
+/*
+ * 初始化内存管理器
+ * 小块内存管理区域的len设置为OSALMEM_SMALLBLK_BUCKET
+ * 大块内存管理区域的len设置为OSALMEM_BIGBLK_SZ
+ * 中间一块内存设置为占用，用以分割两块区域
+ * 最后一块内存的len设置为0，代表后面没有内存区域了
+ */
+void osal_mem_init(void) {
+  OSAL_ASSERT(((OSALMEM_MIN_BLKSZ % OSALMEM_HDRSZ) == 0));
+  OSAL_ASSERT(((OSALMEM_SMALL_BLKSZ % OSALMEM_HDRSZ) == 0));
+
+#if OSALMEM_PROFILER
+  (void)osal_memset(theHeap, OSALMEM_INIT, MAXMEMHEAP);
+#endif
+
+  // 最后一块内存的len设置为0，代表后面没有内存区域了
+  theHeap[OSALMEM_LASTBLK_IDX].val = 0;
+
+  // 小块内存管理区域的len设置为OSALMEM_SMALLBLK_BUCKET
+  // Set 'len' & clear 'inUse' field.
+  ff1 = theHeap;
+  ff1->val = OSALMEM_SMALLBLK_BUCKET;
+
+  // 中间一块内存设置为占用，用以分割两块区域
+  // Set 'len' & 'inUse' fields - this is a 'zero data bytes' lifetime
+  // allocation to block the small-block bucket from ever being coalesced with
+  // the wilderness.
+  theHeap[OSALMEM_SMALLBLK_HDRCNT].val = (OSALMEM_HDRSZ | OSALMEM_IN_USE);
+
+  // 大块内存管理区域的len设置为OSALMEM_BIGBLK_SZ
+  // Set 'len' & clear 'inUse' field.
+  theHeap[OSALMEM_BIGBLK_IDX].val = OSALMEM_BIGBLK_SZ;
+
+#if (OSALMEM_METRICS)
+  /* Start with the small-block bucket and the wilderness - don't count the
+   * end-of-heap NULL block nor the end-of-small-block NULL block.
+   */
+  blkCnt = blkFree = 2;
 #endif
 }
 
-/*********************************************************************
- * @fn osal_mem_kick
- *
- * @brief   Kick the ff1 pointer out past the long-lived OSAL Task blocks.
- *          Invoke this once after all long-lived blocks have been allocated -
- *          presently at the end of osal_init_system().
- *          使FF1跳过固定长度区域，指向FF2(可变长度区域)，也就是这个意思：
- *          如果在固定分配区域中没有申请内存成功，
- *          调用此函数后它将修改指向固定分配区域的指针使指针指向可变分配区域，
- *          然后再调用osal_mem_alloc 它将在可变长度分配区域中进行内存分配。
- *
- * @param   void
- *
- * @return  void
+/*
+ * 设置ff1指针跳过常驻内存区域，指向可申请区域的地址，加快后续的内存申请效率
+ * 当系统任务都创建和初始化完成后调用此函数
  */
-void osal_mem_kick(void)
-{
-    //halIntState_t  intState;
-    HAL_ENTER_CRITICAL_SECTION();  // Hold off interrupts.
+void osal_mem_kick(void) {
+  osal_mem_hdr_t *tmp = osal_mem_alloc(1);
+  OSAL_ASSERT((tmp != NULL));
+  hal_reg_t cpu_sr = hal_enter_critical();
 
-    /* Logic in osal_mem_free() will ratchet ff1 back down to the first free
-     * block in the small-block bucket.
-     */
-    ff1 = ff2;
+  // 此时申请的内存区域，已经在常驻内存区域的后面了
+  // Set 'ff1' to point to the first available memory after the LL block.
+  ff1 = tmp - 1;
 
-    HAL_EXIT_CRITICAL_SECTION();  // Re-enable interrupts.
+  osal_mem_free(tmp);
+
+  // Set 'mem_stat' after the free because it enables memory profiling.
+  mem_stat = 0x01;
+  hal_exit_critical(cpu_sr);
 }
 
-/*********************************************************************
- * @fn osal_mem_alloc
+/**
+ * @brief 申请内存
  *
- * @brief   Implementation of the allocator functionality.
- *
- * @param   size - number of bytes to allocate from the heap.
- *
- * @return  void * - pointer to the heap allocation; NULL if error or failure.
+ * @param size 期望申请的内存大小Byte
+ * @return void* 成功返回申请到的内存地址，失败返回NULL
  */
-void *osal_mem_alloc(uint16 size)
+#if DPRINTF_OSALHEAPTRACE
+void *osal_mem_alloc_dbg(uint16_t size, const char *fname, unsigned lnum)
+#else  /* DPRINTF_OSALHEAPTRACE */
+void *osal_mem_alloc(uint16_t size)
+#endif /* DPRINTF_OSALHEAPTRACE */
 {
-    osalMemHdr_t  *prev;
-    osalMemHdr_t  *hdr;
-    uint16  tmp;
-    byte coal = 0;
+  osal_mem_hdr_t *prev = NULL;
+  osal_mem_hdr_t *hdr;
+  hal_reg_t intState;
+  uint8_t coal = 0;
 
-#if ( OSALMEM_GUARD )
-    // Try to protect against premature use by HAL / OSAL.
-    if(ready != OSALMEM_READY)
-    {
-        osal_mem_init();
+  size += OSALMEM_HDRSZ;
+
+  // size字对齐
+  // Calculate required bytes to add to 'size' to align to halDataAlign_t.
+  if (sizeof(halDataAlign_t) == 2) {
+    size += (size & 0x01);
+  } else if (sizeof(halDataAlign_t) != 1) {
+    const uint8_t mod = size % sizeof(halDataAlign_t);
+
+    if (mod != 0) {
+      size += (sizeof(halDataAlign_t) - mod);
+    }
+  }
+
+  // HAL_ENTER_CRITICAL_SECTION(intState); // Hold off interrupts.
+  intState = hal_enter_critical();
+
+  // 初始化阶段只在固定区域进行分配，这些内存就是常驻内存了
+  // 初始化完成后，如果申请的size小于OSALMEM_SMALL_BLKSZ，则直接从固定区域分配，否则从非固定区域分配
+  // Smaller allocations are first attempted in the small-block bucket, and all
+  // long-lived allocations are channeled into the LL block reserved within this
+  // bucket.
+  if ((mem_stat == 0) || (size <= OSALMEM_SMALL_BLKSZ)) {
+    hdr = ff1;
+  } else {
+    hdr = (theHeap + OSALMEM_BIGBLK_IDX);
+  }
+
+  // 1、如果hdr指向的区域未被使用，且大小大于等于申请的size，跳出循环
+  // 2、如果hdr指向的区域未被使用，且大小小于等于申请的size，hdr跳转到下一个区域
+  // 2.1、如果下一个区域也没被占用，则把两个区域合并起来，再次判断大小是否OK，如果OK跳出循环，如果不OK，HDR继续跳到下一个区域
+  // 2.2、如果下一个区域被占用，则跳转到下一个区域
+  do {
+    if (hdr->inUse) {
+      coal = 0;
+    } else {
+      if (coal != 0) {
+#if (OSALMEM_METRICS)
+        blkCnt--;
+        blkFree--;
+#endif
+
+        prev->len += hdr->len;
+
+        if (prev->len >= size) {
+          hdr = prev;
+          break;
+        }
+      } else {
+        if (hdr->len >= size) {
+          break;
+        }
+
+        coal = 1;
+        prev = hdr;
+      }
+    }
+
+    hdr = (osal_mem_hdr_t *)((uint8_t *)hdr + hdr->len);
+
+    if (hdr->val == 0) {
+      hdr = NULL;
+      break;
+    }
+  } while (1);
+
+  // 如果找到了合适的区域，看看要不要进行拆分
+  // 当区域的大小超过size+OSALMEM_MIN_BLKSZ，则进行拆分
+  // 否则不进行拆分了
+  if (hdr != NULL) {
+    uint16_t tmp = hdr->len - size;
+
+    // Determine whether the threshold for splitting is met.
+    if (tmp >= OSALMEM_MIN_BLKSZ) {
+      // Split the block before allocating it.
+      osal_mem_hdr_t *next = (osal_mem_hdr_t *)((uint8_t *)hdr + size);
+      next->val = tmp;                    // Set 'len' & clear 'inUse' field.
+      hdr->val = (size | OSALMEM_IN_USE); // Set 'len' & 'inUse' field.
+
+#if (OSALMEM_METRICS)
+      blkCnt++;
+      if (blkMax < blkCnt) {
+        blkMax = blkCnt;
+      }
+      memAlo += size;
+#endif
+    } else {
+#if (OSALMEM_METRICS)
+      memAlo += hdr->hdr.len;
+      blkFree--;
+#endif
+
+      hdr->inUse = TRUE;
+    }
+
+#if (OSALMEM_METRICS)
+    if (memMax < memAlo) {
+      memMax = memAlo;
     }
 #endif
 
-    size += HDRSZ;
-
-    // Calculate required bytes to add to 'size' to align to halDataAlign_t.
-    //根据实际的芯片的字长halDataAlign_t进行字节对齐
-    if(sizeof(halDataAlign_t) == 2)
-    {
-        size += (size & 0x01);
-    }
-    else if(sizeof(halDataAlign_t) != 1)
-    {
-        const byte mod = size % sizeof(halDataAlign_t);
-
-        if(mod != 0)
-        {
-            size += (sizeof(halDataAlign_t) - mod);
-        }
-    }
-
-    HAL_ENTER_CRITICAL_SECTION();       // Hold off interrupts.
-
-    // Smaller allocations are first attempted in the small-block bucket.
-    if(size <= OSALMEM_SMALL_BLKSZ)
-    {
-        hdr = ff1;
-    }
-    else
-    {
-        hdr = ff2;
-    }
-    tmp = *hdr;
-
-    do
-    {
-        if(tmp & OSALMEM_IN_USE)
-        {
-            tmp ^= OSALMEM_IN_USE;          //该片已被使用，得出长度
-            coal = 0;                       //找到空内存标志清零，因为遇到了一片已使用的内存
-        }
-        else                                //该片未被使用
-        {
-            if(coal != 0)                   //上轮查找有找到空内存，但空间不够
-            {
-#if ( OSALMEM_METRICS )
-                blkCnt--;                   //内存合并，总内存块计数减一
-                blkFree--;                  //内存合并，空闲内存块计数减一
+#if (OSALMEM_PROFILER)
+#if !OSALMEM_PROFILER_LL
+    if (mem_stat != 0) // Don't profile until after the LL block is filled.
 #endif
-                *prev += *hdr;              //加上本次找到的空内存大小
-
-                if(*prev >= size)           //加上后内存大小符合申请需要
-                {
-                    hdr = prev;             //返回该内存块
-                    tmp = *hdr;             //得出长度
-                    break;
-                }
-            }
-            else                            //上轮查找未找到空内存
-            {
-                if(tmp >= size)             //该片内存大小符合需求，跳出查找循环
-                {
-                    break;
-                }
-
-                coal = 1;                   //该片内存大小不符合需求，标记找到一块空内存
-                prev = hdr;                 //记录该内存
-            }
-        }
-
-        hdr = (osalMemHdr_t *)((byte *)hdr + tmp);  //偏移至下一片内存区域
-
-        tmp = *hdr;                         //读取该区域长度
-        if(tmp == 0)
-        {
-            hdr = ((void *)NULL);
-            break;
-        }
-    } while(1);
-
-    if(hdr != ((void *)NULL))
     {
-        tmp -= size;                        //本次申请后剩余长度
-        // Determine whether the threshold for splitting is met.
-        if(tmp >= OSALMEM_MIN_BLKSZ)        //剩余空间大于最小需求空间，分割内存供下次申请
-        {
-            // Split the block before allocating it.
-            osalMemHdr_t *next = (osalMemHdr_t *)((byte *)hdr + size);  //偏移
-            *next = tmp;                    //记录未使用区域剩余长度
-            *hdr = (size | OSALMEM_IN_USE); //标志本次申请区域已被使用，并记录本次使用长度
+      uint8_t idx;
 
-#if ( OSALMEM_METRICS )
-            blkCnt++;                       //内存分割，总内存块计数加一
-            if(blkMax < blkCnt)
-            {
-                blkMax = blkCnt;            //调整内存块数量最大值
-            }
-            memAlo += size;                 //调整已用内存大小
-#endif
+      for (idx = 0; idx < OSALMEM_PROMAX; idx++) {
+        if (hdr->hdr.len <= proCnt[idx]) {
+          break;
         }
-        else
-        {
-#if ( OSALMEM_METRICS )
-            memAlo += *hdr;
-            blkFree--;                      //内存不分割，空闲内存块计数减一
+      }
+      proCur[idx]++;
+      if (proMax[idx] < proCur[idx]) {
+        proMax[idx] = proCur[idx];
+      }
+      proTot[idx]++;
+
+      /* A small-block could not be allocated in the small-block bucket.
+       * When this occurs significantly frequently, increase the size of the
+       * bucket in order to restore better worst case run times. Set the first
+       * profiling bucket size in proCnt[] to the small-block bucket size and
+       * divide proSmallBlkMiss by the corresponding proTot[] size to get %
+       * miss. Best worst case time on TrasmitApp was achieved at a 0-15% miss
+       * rate during steady state Tx load, 0% during idle and steady state Rx
+       * load.
+       */
+      if ((hdr->hdr.len <= OSALMEM_SMALL_BLKSZ) &&
+          (hdr >= (theHeap + OSALMEM_BIGBLK_IDX))) {
+        proSmallBlkMiss++;
+      }
+    }
+
+    (void)osal_memset((uint8_t *)(hdr + 1), OSALMEM_ALOC,
+                      (hdr->hdr.len - OSALMEM_HDRSZ));
 #endif
 
-            *hdr |= OSALMEM_IN_USE;
-        }
-
-#if ( OSALMEM_METRICS )
-        if(memMax < memAlo)
-        {
-            memMax = memAlo;
-        }
-#endif
-
-        hdr++;                              //偏移，返回实际申请的内存地址
+    // 如果分配的区域是最开始的块，移动ff1，提高下次分配的效率
+    if ((mem_stat != 0) && (ff1 == hdr)) {
+      ff1 = (osal_mem_hdr_t *)((uint8_t *)hdr + hdr->len);
     }
 
-    HAL_EXIT_CRITICAL_SECTION();            // Re-enable interrupts.
+    // 返回给调用者的是把头部去掉后的真正可用的区域
+    hdr++;
+  }
 
-    return (void *)hdr;
+  // HAL_EXIT_CRITICAL_SECTION(intState); // Re-enable interrupts.
+  hal_exit_critical(intState);
+
+  OSAL_ASSERT(((size_t)hdr % sizeof(halDataAlign_t)) == 0);
+
+#if DPRINTF_OSALHEAPTRACE
+  dprintf("osal_mem_alloc(%u)->%lx:%s:%u\n", size, (unsigned)hdr, fname, lnum);
+#endif /* DPRINTF_OSALHEAPTRACE */
+  return (void *)hdr;
 }
 
-/*********************************************************************
- * @fn osal_mem_free
- *
- * @brief   Implementation of the de-allocator functionality.
- *
- * @param   ptr - pointer to the memory to free.
- *
- * @return  void
+/*
+ * Free a block of memory.
  */
+#if DPRINTF_OSALHEAPTRACE
+void osal_mem_free_dbg(void *ptr, const char *fname, unsigned lnum)
+#else  /* DPRINTF_OSALHEAPTRACE */
 void osal_mem_free(void *ptr)
+#endif /* DPRINTF_OSALHEAPTRACE */
 {
-    osalMemHdr_t  *currHdr;
-    //halIntState_t   intState;
+  osal_mem_hdr_t *hdr = (osal_mem_hdr_t *)ptr - 1;
+  hal_reg_t intState;
 
-#if ( OSALMEM_GUARD )
-    // Try to protect against premature use by HAL / OSAL.
-    if(ready != OSALMEM_READY)
-    {
-        osal_mem_init();
-    }
+#if DPRINTF_OSALHEAPTRACE
+  dprintf("osal_mem_free(%lx):%s:%u\n", (unsigned)ptr, fname, lnum);
+#endif /* DPRINTF_OSALHEAPTRACE */
+
+  HAL_ASSERT(((uint8_t *)ptr >= (uint8_t *)theHeap) &&
+             ((uint8_t *)ptr < (uint8_t *)theHeap + MAXMEMHEAP));
+  HAL_ASSERT(hdr->inUse);
+
+  // HAL_ENTER_CRITICAL_SECTION(intState); // Hold off interrupts.
+  intState = hal_enter_critical();
+  hdr->inUse = FALSE;
+
+  // 释放的区域在ff1前面，移动ff1
+  if (ff1 > hdr) {
+    ff1 = hdr;
+  }
+
+#if OSALMEM_PROFILER
+#if !OSALMEM_PROFILER_LL
+  if (mem_stat != 0) // Don't profile until after the LL block is filled.
 #endif
+  {
+    uint8_t idx;
 
-    HAL_ENTER_CRITICAL_SECTION();  // Hold off interrupts.
-
-    currHdr = (osalMemHdr_t *)ptr - 1;
-
-    *currHdr &= ~OSALMEM_IN_USE;
-
-    if(ff1 > currHdr)
-    {
-        ff1 = currHdr;
+    for (idx = 0; idx < OSALMEM_PROMAX; idx++) {
+      if (hdr->hdr.len <= proCnt[idx]) {
+        break;
+      }
     }
 
+    proCur[idx]--;
+  }
+
+  (void)osal_memset((uint8_t *)(hdr + 1), OSALMEM_REIN,
+                    (hdr->hdr.len - OSALMEM_HDRSZ));
+#endif
 #if OSALMEM_METRICS
-    memAlo -= *currHdr;
-    blkFree++;
+  memAlo -= hdr->hdr.len;
+  blkFree++;
 #endif
 
-    HAL_EXIT_CRITICAL_SECTION();  // Re-enable interrupts.
+  // HAL_EXIT_CRITICAL_SECTION(intState); // Re-enable interrupts.
+  hal_exit_critical(intState);
 }
 
 #if OSALMEM_METRICS
 /*********************************************************************
- * @fn osal_heap_block_max
+ * @fn      osal_heap_block_max
  *
  * @brief   Return the maximum number of blocks ever allocated at once.
  *
@@ -354,13 +449,10 @@ void osal_mem_free(void *ptr)
  *
  * @return  Maximum number of blocks ever allocated at once.
  */
-uint16 osal_heap_block_max(void)
-{
-    return blkMax;
-}
+uint16_t osal_heap_block_max(void) { return blkMax; }
 
 /*********************************************************************
- * @fn osal_heap_block_cnt
+ * @fn      osal_heap_block_cnt
  *
  * @brief   Return the current number of blocks now allocated.
  *
@@ -368,13 +460,10 @@ uint16 osal_heap_block_max(void)
  *
  * @return  Current number of blocks now allocated.
  */
-uint16 osal_heap_block_cnt(void)
-{
-    return blkCnt;
-}
+uint16_t osal_heap_block_cnt(void) { return blkCnt; }
 
 /*********************************************************************
- * @fn osal_heap_block_free
+ * @fn      osal_heap_block_free
  *
  * @brief   Return the current number of free blocks.
  *
@@ -382,13 +471,10 @@ uint16 osal_heap_block_cnt(void)
  *
  * @return  Current number of free blocks.
  */
-uint16 osal_heap_block_free(void)
-{
-    return blkFree;
-}
+uint16_t osal_heap_block_free(void) { return blkFree; }
 
 /*********************************************************************
- * @fn osal_heap_mem_used
+ * @fn      osal_heap_mem_used
  *
  * @brief   Return the current number of bytes allocated.
  *
@@ -396,13 +482,10 @@ uint16 osal_heap_block_free(void)
  *
  * @return  Current number of bytes allocated.
  */
-uint16 osal_heap_mem_used(void)
-{
-    return memAlo;
-}
+uint16_t osal_heap_mem_used(void) { return memAlo; }
 
 /*********************************************************************
- * @fn osal_heap_high_water
+ * @fn      osal_heap_high_water
  *
  * @brief   Return the highest byte ever allocated in the heap.
  *
@@ -410,19 +493,15 @@ uint16 osal_heap_mem_used(void)
  *
  * @return  Highest number of bytes ever used by the stack.
  */
-uint16 osal_heap_high_water(void)
-{
-#if ( OSALMEM_METRICS )
-    return memMax;
+uint16_t osal_heap_high_water(void) {
+#if (OSALMEM_METRICS)
+  return memMax;
 #else
-    return MAXMEMHEAP;
+  return MAXMEMHEAP;
 #endif
 }
+#endif
 
-//返回内存使用率
-uint16 osal_heap_mem_usage_rate(void)
-{
-    return (uint16)(memAlo / (MAXMEMHEAP / 100));
+#ifdef __cplusplus
 }
-
 #endif

@@ -16,14 +16,13 @@ void osal_main(void)
     HAL_DISABLE_INTERRUPTS();
 
     //osal操作系统初始化
-    osal_init_system();
+    osal_init();
 
     //添加任务
     osal_add_Task(print_task_init, print_task_event_process, 1);
     osal_add_Task(statistics_task_init, statistics_task_event_process, 2);
 
-    //添加的任务统一进行初始化
-    osal_Task_init();
+    
 
     osal_mem_kick();
 
@@ -33,5 +32,5 @@ void osal_main(void)
     //设置初始任务事件，上电就需要自动轮询的任务事件可在此添加
 
     //启动osal系统，不会再返回
-    osal_start_system();
+    osal_run();
 }
