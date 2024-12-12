@@ -25,12 +25,6 @@ void hal_enable_interrupt(void);
 void hal_disable_interrupt(void);
 
 /**
- * @brief 查询中断是否使能
- *
- */
-bool hal_interrupt_enabled(void);
-
-/**
  * @brief 禁用全局中断，并保存当前中断使能状态
  *
  * @return hal_reg_t

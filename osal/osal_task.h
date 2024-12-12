@@ -84,3 +84,12 @@ int8_t osal_clear_event(struct osal_tcb *task, uint16_t event_flag);
  * @return uint16_t 事件标志
  */
 uint16_t osal_get_event(const struct osal_tcb *task);
+
+/**
+ * @brief 将消息放到任务的消息列表中
+ * 任务消费完消息后负责释放消息缓冲区
+ * @param task 任务指针
+ * @param msg 消息指针
+ * @param len 消息长度
+ */
+void osal_send_msg(struct osal_tcb *task, uint8_t *msg, uint16_t len);
